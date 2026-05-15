@@ -32,3 +32,6 @@ env_deleted_tokens.txt
 data/proxies.txt*
 *.bak.*
 *.bak
+
+# Seed token registry — intentionally tracked (7k groups / 22k contracts)
+!data/groups_dump.json
