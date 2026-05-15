@@ -1,0 +1,22 @@
+# Async HTTP
+aiohttp==3.9.5
+
+# Redis
+redis==5.0.6
+hiredis==2.3.2
+
+# Config
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.3.1
+PyYAML==6.0.1
+
+# Telegram
+aiogram==3.7.0
+
+# Utilities
+structlog==24.2.0
+
+# On-chain price verification
+web3==6.20.1
+eth-abi==5.1.0

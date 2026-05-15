@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.local
+
+# Proxy list with credentials
+data/proxies.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / runtime
+*.log
+*.pid
+
+# Local-only debug dumps
+*_dump.json
+*_dump.txt
+env_deleted_tokens.txt
+
+# Proxy files (any variant/backup — credentials)
+data/proxies.txt*
+*.bak.*
+*.bak

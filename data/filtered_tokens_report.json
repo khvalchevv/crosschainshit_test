@@ -1,0 +1,184 @@
+{
+  "generated_at": "2026-05-13 15:47:24",
+  "note": "tokens we killed via liq/vol gate — contracts + current detected spread",
+  "tokens": [
+    {
+      "cg_id": "adobe-ondo-tokenized-stock",
+      "found": true,
+      "n_chains": 3,
+      "bridges": [
+        "stargate"
+      ],
+      "spread_pct": 0.0,
+      "chains": [
+        {
+          "chain": "bsc",
+          "address": "0xcb22db0ecb6fe58b7b47db443dcfdfdfbf729cef",
+          "price_usd": 239.92,
+          "liq_usd": null
+        },
+        {
+          "chain": "ethereum",
+          "address": "0x7042a8ffc7c7049684bfbc2fcb41b72380755a43",
+          "price_usd": 239.92,
+          "liq_usd": null
+        },
+        {
+          "chain": "solana",
+          "address": "12rh6jhfw4x5fkp16bbudb4pcvckdhfb48x8gg33ondo",
+          "price_usd": 239.92,
+          "liq_usd": null
+        }
+      ]
+    },
+    {
+      "cg_id": "numine-token",
+      "found": true,
+      "n_chains": 3,
+      "bridges": [
+        "exchanges",
+        "layerzero"
+      ],
+      "spread_pct": 0.01,
+      "chains": [
+        {
+          "chain": "avalanche",
+          "address": "0x59234b44214d88c57b7c54a6d2633334d95c5161",
+          "price_usd": 0.013188256360579602,
+          "liq_usd": null
+        },
+        {
+          "chain": "bsc",
+          "address": "0xc61eb549acf4a05ed6e3fe0966f5e213b23541ce",
+          "price_usd": 0.01319,
+          "liq_usd": null
+        },
+        {
+          "chain": "ethereum",
+          "address": "0xc61eb549acf4a05ed6e3fe0966f5e213b23541ce",
+          "price_usd": null,
+          "liq_usd": null
+        }
+      ]
+    },
+    {
+      "cg_id": "sg-xdc",
+      "found": true,
+      "n_chains": 4,
+      "bridges": [
+        "layerzero",
+        "stargate"
+      ],
+      "spread_pct": 0.0,
+      "chains": [
+        {
+          "chain": "arbitrum",
+          "address": "0x11a72d2a88468c09f1bb63fc729d8649e84275a9",
+          "price_usd": 0.032062650274111294,
+          "liq_usd": null
+        },
+        {
+          "chain": "base",
+          "address": "0x11a72d2a88468c09f1bb63fc729d8649e84275a9",
+          "price_usd": 0.032062650274111294,
+          "liq_usd": null
+        },
+        {
+          "chain": "ethereum",
+          "address": "0x11a72d2a88468c09f1bb63fc729d8649e84275a9",
+          "price_usd": 0.032062650274111294,
+          "liq_usd": null
+        },
+        {
+          "chain": "solana",
+          "address": "gtlniirqt25acv3jbstzehd7rgfrrbuk52oqu5iezsxg",
+          "price_usd": null,
+          "liq_usd": null
+        }
+      ]
+    },
+    {
+      "cg_id": "marginswap",
+      "found": true,
+      "n_chains": 3,
+      "bridges": [
+        "lifi"
+      ],
+      "spread_pct": 1.77,
+      "chains": [
+        {
+          "chain": "avalanche",
+          "address": "0x9fda7ceec4c18008096c2fe2b85f05dc300f94d0",
+          "price_usd": 0.009182203142106824,
+          "liq_usd": null
+        },
+        {
+          "chain": "ethereum",
+          "address": "0xaa4e3edb11afa93c41db59842b29de64b72e355b",
+          "price_usd": 0.009022517182806833,
+          "liq_usd": 2368.640708
+        },
+        {
+          "chain": "polygon",
+          "address": "0x7bc429a2fa7d71c4693424fdcab5a2521b9fd343",
+          "price_usd": 0.009182203142106824,
+          "liq_usd": null
+        }
+      ]
+    },
+    {
+      "cg_id": "math",
+      "found": true,
+      "n_chains": 7,
+      "bridges": [
+        "lifi",
+        "wormhole"
+      ],
+      "spread_pct": 167.21,
+      "chains": [
+        {
+          "chain": "arbitrum",
+          "address": "0x99f40b01ba9c469193b360f72740e416b17ac332",
+          "price_usd": 0.02749859250220833,
+          "liq_usd": null
+        },
+        {
+          "chain": "base",
+          "address": "0x9e81f6495ba29a6b4d48bddd042c0598fa8abc9f",
+          "price_usd": 0.07252147349740432,
+          "liq_usd": 32410.33051227752
+        },
+        {
+          "chain": "bsc",
+          "address": "0xf218184af829cf2b0019f8e6f0b2423498a36983",
+          "price_usd": 0.027324875353787012,
+          "liq_usd": 101274.78306856363
+        },
+        {
+          "chain": "ethereum",
+          "address": "0x08d967bb0134f2d07f7cfb6e246680c53927dd30",
+          "price_usd": 0.027630019093963926,
+          "liq_usd": 26157.24603671808
+        },
+        {
+          "chain": "gnosis",
+          "address": "0xaf4d17a2077e1de12de66a44de1b4f14c120d32d",
+          "price_usd": null,
+          "liq_usd": null
+        },
+        {
+          "chain": "polygon",
+          "address": "0x347accafda7f8c5bdec57fa34a5b663cbd1aeca7",
+          "price_usd": 0.02749859250220833,
+          "liq_usd": null
+        },
+        {
+          "chain": "solana",
+          "address": "caga7pddfxs65gznqwp42kbhkjqdceofvt7aqyo8jr8q",
+          "price_usd": 0.02714,
+          "liq_usd": null
+        }
+      ]
+    }
+  ]
+}
