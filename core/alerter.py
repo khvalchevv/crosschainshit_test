@@ -1,87 +1,86 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
-    CallbackQuery,
 )
 
 from config import get_settings
-from core.bridge_sources import get_bridges_for
 from core.detector import CrossChainOpportunity
-from core.monitor import get_price
-from utils import get_logger, get_redis
+from utils import get_logger, get_redis, norm_addr
 
 log = get_logger(__name__)
 
-import datetime as _dt
-import re
-
 _SUBSCRIBERS_KEY = "cc2_subscribers"
+_BLACKLIST_KEY   = "cc2_blacklist"      # set of lowercase token ids
+_LEGBLACKLIST_KEY = "cc2_blacklist_leg"  # set of "{cg_id}@{chain}" legs
+
+_RESEARCHER_BOT = "researcheer_bot"     # opens with /start <ticker>
+
+
+def _researcher_url(ticker: str, fallback: str = "") -> str:
+    import re as _re
+    payload = _re.sub(r"[^A-Za-z0-9_-]", "", (ticker or fallback))[:64]
+    return f"https://t.me/{_RESEARCHER_BOT}?start={payload}"
 
 
 def _now_kyiv() -> str:
-    """Current time in UTC+3 (Kyiv)."""
-    return (_dt.datetime.utcnow() + _dt.timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S UTC+3")
-_BLACKLIST_KEY   = "cc2_blacklist"     # set of lowercase token identifiers (symbol or cg_id)
+    return (_dt.datetime.utcnow() + _dt.timedelta(hours=3)).strftime(
+        "%Y-%m-%d %H:%M:%S UTC+3")
+
+
+def _now_kyiv_time() -> str:
+    return (_dt.datetime.utcnow() + _dt.timedelta(hours=3)).strftime(
+        "%H:%M:%S UTC+3")
 
 
 def _strip_html(s: str) -> str:
-    """Remove HTML tags — fallback when Telegram rejects HTML formatting."""
     return re.sub(r"<[^>]+>", "", s)
 
-_EXPLORER = {
-    "ethereum":  "https://etherscan.io/address/{}",
-    "bsc":       "https://bscscan.com/address/{}",
-    "polygon":   "https://polygonscan.com/address/{}",
-    "arbitrum":  "https://arbiscan.io/address/{}",
-    "base":      "https://basescan.org/address/{}",
-    "optimism":  "https://optimistic.etherscan.io/address/{}",
-    "avalanche": "https://snowtrace.io/address/{}",
-    "fantom":    "https://ftmscan.com/address/{}",
-    "zksync":    "https://explorer.zksync.io/address/{}",
-    "linea":     "https://lineascan.build/address/{}",
-    "blast":     "https://blastscan.io/address/{}",
-    "scroll":    "https://scrollscan.com/address/{}",
-    "mantle":    "https://explorer.mantle.xyz/address/{}",
-    "berachain": "https://berascan.com/address/{}",
-    "solana":    "https://solscan.io/token/{}",
-    "sui":       "https://suivision.xyz/coin/{}",
-    "aptos":     "https://explorer.aptoslabs.com/coin/{}",
-    "tron":      "https://tronscan.org/#/token20/{}",
-    "near":      "https://nearblocks.io/token/{}",
-}
+
+async def _bridges_for(cg_id: str) -> list[str]:
+    r = await get_redis()
+    members = await r.smembers(f"cg2:bridges:{cg_id}") or set()
+    return sorted(
+        m.decode() if isinstance(m, bytes) else m for m in members)
 
 
 def _dexscreener_url(chain: str, addr: str) -> str:
     return f"https://dexscreener.com/{chain}/{addr}"
 
 
-def _gmgn_url(chain: str, addr: str) -> str:
-    """GMGN supports sol/eth/base/bsc/tron — for others fall back to DS."""
-    slug = {
-        "solana": "sol", "ethereum": "eth", "base": "base",
-        "bsc": "bsc", "tron": "tron",
-    }.get(chain)
-    return f"https://gmgn.ai/{slug}/token/{addr}" if slug else _dexscreener_url(chain, addr)
+# Our chain name → OKX Web3 token-page slug. Only chains OKX Web3 actually
+# serves are listed; anything else falls back to DexScreener so a button is
+# never a dead link.
+_OKX_CHAIN = {
+    "ethereum": "ethereum", "bsc": "bsc",        "polygon": "polygon",
+    "arbitrum": "arbitrum-one", "optimism": "optimism", "base": "base",
+    "avalanche": "avalanche", "fantom": "fantom", "linea": "linea",
+    "scroll":   "scroll",   "blast":   "blast",   "mantle": "mantle",
+    "zksync":   "zksync",   "opbnb":   "opbnb",   "manta":  "manta",
+    "sonic":    "sonic",    "okex":    "x-layer", "core":   "core",
+    "solana":   "solana",   "tron":    "tron",    "ton":    "ton",
+    "sui":      "sui",      "aptos":   "aptos",
+}
 
 
-def _dextools_url(chain: str, addr: str) -> str:
-    slug = {
-        "ethereum": "ether", "bsc": "bnb", "polygon": "polygon",
-        "arbitrum": "arbitrum", "base": "base", "optimism": "optimism",
-        "avalanche": "avalanche", "fantom": "fantom",
-    }.get(chain, chain)
-    return f"https://www.dextools.io/app/en/{slug}/pair-explorer/{addr}"
+def _okx_url(chain: str, addr: str) -> str:
+    slug = _OKX_CHAIN.get(chain)
+    if slug:
+        return f"https://web3.okx.com/ru/token/{slug}/{addr}"
+    return _dexscreener_url(chain, addr)
 
 
-# ── Format helpers (module-level so /check can reuse) ─────────────────────────
+# ── Format helpers ────────────────────────────────────────────────────────
 
 def _fmt_money(v: float | None) -> str:
     if v is None:        return "—"
@@ -90,129 +89,136 @@ def _fmt_money(v: float | None) -> str:
     return f"${v:,.0f}"
 
 
-def _fmt_price(p: float) -> str:
-    """Compact price keeping significant digits."""
+def _fmt_price(p: float | None) -> str:
     if p is None or p <= 0:  return "—"
     if p >= 1000:            return f"{p:,.2f}"
-    if p >= 1:               return f"{p:.4g}"
     if p >= 0.0001:          return f"{p:.4g}"
     return f"{p:.6g}"
 
 
 def _liq_emoji(v: float | None) -> str:
-    if v is None:        return "❓"
-    if v < 5_000:        return "🔴"
-    if v < 50_000:       return "🟠"
-    if v < 200_000:      return "🟡"
-    if v < 1_000_000:    return "🟢"
-    return "💎"
+    if v is None:        return "❓"   # no liquidity data
+    if v < 5_000:        return "🔴"   # < $5k
+    if v < 40_000:       return "🟡"   # $5k–$40k
+    return "🟢"                         # ≥ $40k
 
 
 def _spread_emoji(s: float) -> str:
-    """Return emoji based on spread magnitude."""
-    if s >= 200:  return "⚠️"   # suspicious — likely ghost pool
-    if s >= 30:   return "💥"   # explosive
-    if s >= 15:   return "🔥"   # hot
-    return "👍"                  # ok / small
+    if s > 20:   return "🔥"   # >20%
+    if s >= 10:  return "💥"   # 10–20%
+    return "👍"                 # <10%
 
 
-def _trim_addr(addr: str) -> str:
-    """For tight inline display; full addr stays in <code> for copy."""
-    if not addr:           return "—"
-    if len(addr) <= 16:    return addr
-    return f"{addr[:6]}...{addr[-4:]}"
+# Only these chains are abbreviated (UPPERCASE). Every other chain is shown
+# with a normal Capitalised name (e.g. base → Base, polygon → Polygon).
+_CHAIN_LABEL = {
+    "ethereum": "ETH",
+    "arbitrum": "ARB",
+    "solana":   "SOL",
+    "optimism": "OP",
+    "bsc":      "BSC",
+}
 
 
-def _chain_cell(url: str, chain: str, width: int = 12) -> str:
-    """Render '<a>CHAIN</a>{padding}' — link only on the letters, not trailing spaces."""
-    name = chain.upper()[:width]
-    pad  = " " * max(0, width - len(name))
-    return f"<a href='{url}'>{name}</a>{pad}"
+def _chain_label(chain: str) -> str:
+    return _CHAIN_LABEL.get(chain) or chain.capitalize()
+
+
+def _fmt_age(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m {s}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
+def _pct(p: float) -> str:
+    return f"{p:.2f}".rstrip("0").rstrip(".")
+
+
+def _liq_str(liq: float | None) -> str:
+    return _fmt_money(liq) if liq else "-"
 
 
 def _build_alert_text(
     opp: "CrossChainOpportunity",
     bridges: list[str],
     other_chains: list[tuple[str, str, float | None, float | None]] | None = None,
+    muted_chains: list[str] | None = None,
 ) -> str:
-    """Alert layout: header → route → bridges → unified per-chain block w/ contracts."""
     emoji = _spread_emoji(opp.gross_spread_pct)
+    ticker = (opp.ticker or "").upper() or opp.cg_id.upper()
     cheap_url = _dexscreener_url(opp.cheap_chain, opp.cheap_addr)
     exp_url   = _dexscreener_url(opp.expensive_chain, opp.expensive_addr)
 
     parts = []
 
-    # Header
+    # Header: #TICKER / % / 🔥
     parts.append(
-        f"{emoji}  <b>{opp.symbol}</b>      "
-        f"▸  <b><u>+{opp.gross_spread_pct:.2f}%</u></b>  ◂\n"
-        f"<i>{_now_kyiv()}</i>"
+        f"<b>#{ticker}</b> / <b>{_pct(opp.gross_spread_pct)}%</b> / {emoji}"
     )
 
-    # Route
-    parts.append(
+    # Route → (Bridge, only if the token came from the Wormhole/L0 JSON)
+    # → spread age
+    _BR = {"wormhole": "Wormhole", "layerzero": "L0"}
+    route = (
         f"<b>Route:</b> "
-        f"<a href='{cheap_url}'>{opp.cheap_chain.upper()}</a>"
-        f" → "
-        f"<a href='{exp_url}'>{opp.expensive_chain.upper()}</a>"
+        f"<a href='{cheap_url}'>{_chain_label(opp.cheap_chain)}</a> → "
+        f"<a href='{exp_url}'>{_chain_label(opp.expensive_chain)}</a>"
+    )
+    if bridges:
+        pretty = " · ".join(_BR.get(b, b.upper()) for b in bridges)
+        route += f"\n<b>Bridge:</b> <i>{pretty}</i>"
+    route += f"\n🕙 <b>Spread alive:</b> {_fmt_age(opp.spread_age_sec)}"
+    parts.append(route)
+
+    # Buy / Sell
+    parts.append(
+        f"<b>Buy:</b> <a href='{cheap_url}'>{_chain_label(opp.cheap_chain)}</a>  "
+        f"<b>${_fmt_price(opp.cheap_price)}</b>  "
+        f"(Liq: {_liq_str(opp.cheap_liq_usd)})  {_liq_emoji(opp.cheap_liq_usd)}\n"
+        f"<code>{opp.cheap_addr}</code>\n"
+        f"<b>Sell:</b> <a href='{exp_url}'>{_chain_label(opp.expensive_chain)}</a>  "
+        f"<b>${_fmt_price(opp.expensive_price)}</b>  "
+        f"(Liq: {_liq_str(opp.expensive_liq_usd)})  "
+        f"{_liq_emoji(opp.expensive_liq_usd)}\n"
+        f"<code>{opp.expensive_addr}</code>"
     )
 
-    # Bridges
-    if bridges:
-        pretty = " · ".join(b.upper() for b in bridges)
-        parts.append(f"<b>Bridges:</b> <i>{pretty}</i>")
-
-    # Thin-liq warning
-    if (opp.cheap_liq_usd is not None and opp.cheap_liq_usd < 5000) or \
-       (opp.expensive_liq_usd is not None and opp.expensive_liq_usd < 5000):
-        parts.append("⚠️ <b>Thin liquidity — risky execution</b>")
-
-    # Unified per-chain section: every chain in the group gets
-    #   <emoji role> <chain link>  <price>  <liq>  <vol>
-    #   <contract>
-    # Order: BUY, SELL, then others (by price asc)
-    def _row(chain: str, addr: str, price: float | None, liq: float | None,
-             vol: float | None, role: str) -> str:
-        url = _dexscreener_url(chain, addr)
-        le  = _liq_emoji(liq)
-        p_s = f"${_fmt_price(price)}" if price else "—"
-        l_s = _fmt_money(liq) if liq else "—"
-        v_s = _fmt_money(vol) if vol is not None else "—"
-        head = (
-            f"{role} <a href='{url}'>{chain.upper()}</a>  "
-            f"<b>{p_s}</b>  {le}{l_s}  ·  {v_s} vol"
-        )
-        return f"{head}\n<code>{addr}</code>"
-
-    chain_rows = [
-        _row(opp.cheap_chain,     opp.cheap_addr,     opp.cheap_price,
-             opp.cheap_liq_usd,   opp.cheap_vol_h24_usd,    "🟢 BUY  "),
-        _row(opp.expensive_chain, opp.expensive_addr, opp.expensive_price,
-             opp.expensive_liq_usd, opp.expensive_vol_h24_usd, "🔴 SELL "),
-    ]
+    # Other chains
     if other_chains:
+        rows = ["<b>other chains:</b>"]
         for chain, addr, price, liq in other_chains:
-            chain_rows.append(_row(chain, addr, price, liq, None, "        "))
+            url = _dexscreener_url(chain, addr)
+            p_s = f"${_fmt_price(price)}" if price else "-"
+            rows.append(
+                f"<a href='{url}'>{_chain_label(chain)}</a>:  {p_s}  "
+                f"(Liq: {_liq_str(liq)})\n<code>{addr}</code>"
+            )
+        parts.append("\n".join(rows))
 
-    parts.append("\n\n".join(chain_rows))
-
-    parts.append(f"<i>cg_id: {opp.cg_id}</i>")
-
+    # Project name at the very end; muted-chain note + time below it
+    tail = f"<b>Project:</b> {opp.cg_id}"
+    if muted_chains:
+        labels = ", ".join(_chain_label(c) for c in muted_chains)
+        tail += f"\n🚫 <b>Muted:</b> {labels}"
+    tail += f"\n<i>{_now_kyiv_time()}</i>"
+    parts.append(tail)
     return "\n\n".join(parts)
 
 
 def _main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📊 Status",     callback_data="menu:status"),
-            InlineKeyboardButton(text="🚫 Blacklist",  callback_data="menu:blacklist"),
+            InlineKeyboardButton(text="📊 Status",    callback_data="menu:status"),
+            InlineKeyboardButton(text="🚫 Blacklist", callback_data="menu:blacklist"),
         ],
         [
-            InlineKeyboardButton(text="🔍 Check token", callback_data="menu:check_hint"),
             InlineKeyboardButton(text="❌ Unsubscribe", callback_data="menu:stop"),
-        ],
-        [
-            InlineKeyboardButton(text="ℹ️ Help", callback_data="menu:help"),
+            InlineKeyboardButton(text="ℹ️ Help",         callback_data="menu:help"),
         ],
     ])
 
@@ -241,12 +247,12 @@ class Alerter:
             await r.sadd(_SUBSCRIBERS_KEY, self._fallback_chat_id)
 
         await self._bot.set_my_commands([
-            {"command": "start",        "description": "Subscribe + open menu"},
-            {"command": "status",       "description": "Scanner stats"},
-            {"command": "check",        "description": "Check a token: /check <id|addr>"},
-            {"command": "blacklist",    "description": "Manage blacklist"},
-            {"command": "stop",         "description": "Unsubscribe"},
-            {"command": "help",         "description": "Show commands"},
+            {"command": "start",     "description": "Subscribe + open menu"},
+            {"command": "status",    "description": "Scanner stats"},
+            {"command": "check",     "description": "Check a token: /check <ticker|id|contract>"},
+            {"command": "blacklist", "description": "Manage blacklist"},
+            {"command": "stop",      "description": "Unsubscribe"},
+            {"command": "help",      "description": "Show commands"},
         ])
 
         self._poll_task = asyncio.create_task(
@@ -283,12 +289,11 @@ class Alerter:
             await r.sadd(_SUBSCRIBERS_KEY, str(msg.chat.id))
             subs = await r.scard(_SUBSCRIBERS_KEY)
             await msg.answer(
-                "✅ <b>Welcome to Cross-Chain Arb Scanner</b>\n\n"
-                "You're now subscribed to real-time alerts when the same token "
-                "has a price gap across chains (Ethereum, BSC, Polygon, Arbitrum, "
-                "Base, Optimism, Solana, SUI, Aptos, and 15+ more).\n\n"
+                "✅ <b>Cross-Chain Spread Scanner</b>\n\n"
+                "You're subscribed to real-time alerts when the same token "
+                "has a price gap across chains.\n\n"
                 f"👥 Active subscribers: <b>{subs}</b>\n\n"
-                "Use the menu below or type /help.",
+                "Use the menu below or /help.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_main_menu(),
             )
@@ -307,53 +312,91 @@ class Alerter:
         @dp.message(Command("status"))
         async def on_status(msg: Message) -> None:
             await msg.answer(await self._status_text(),
-                             parse_mode=ParseMode.HTML, reply_markup=_main_menu())
+                             parse_mode=ParseMode.HTML,
+                             reply_markup=_main_menu())
 
         @dp.message(Command("check"))
         async def on_check(msg: Message) -> None:
-            await self._handle_check(msg)
+            parts = (msg.text or "").strip().split(maxsplit=1)
+            if len(parts) < 2:
+                await msg.answer(
+                    "Usage: <code>/check &lt;ticker | id | contract&gt;</code>\n\n"
+                    "Examples:\n"
+                    "<code>/check ADS</code>\n"
+                    "<code>/check adshares</code>\n"
+                    "<code>/check 0xcfcecfe2bd2fed07a9145222e8a7ad9cf1ccd22a</code>",
+                    parse_mode=ParseMode.HTML)
+                return
+            await msg.answer(await self._check_text(parts[1].strip()),
+                             parse_mode=ParseMode.HTML,
+                             disable_web_page_preview=True)
 
         @dp.message(Command("blacklist"))
         async def on_blacklist(msg: Message) -> None:
             await self._handle_blacklist(msg)
 
-        @dp.callback_query(F.data.startswith("check:"))
-        async def on_check_btn(q: CallbackQuery) -> None:
+        @dp.callback_query(F.data.startswith("chk:"))
+        async def on_chk_btn(q: CallbackQuery) -> None:
+            gid = q.data.split(":", 1)[1]
+            await q.message.answer(await self._check_text(gid),
+                                   parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+            await q.answer()
+
+        @dp.callback_query(F.data.startswith("mn:"))
+        async def on_mute_menu(q: CallbackQuery) -> None:
             cg_id = q.data.split(":", 1)[1]
-            # Reuse the /check logic by faking a message
             r = await get_redis()
             group = await r.hgetall(f"cg2:group:{cg_id}")
             if not group:
-                await q.answer("Not found", show_alert=True)
+                await q.answer("Group not found", show_alert=True)
                 return
-            prices: dict[str, tuple[str, float]] = {}
-            for chain, addr in group.items():
-                p = await get_price(chain, addr)
-                if p and p > 0:
-                    prices[chain] = (addr, p)
-            lines = [f"🔍 <b>{cg_id.upper()}</b> — all chains"]
-            if not prices:
-                lines.append("⚠️ No fresh prices")
-            else:
-                sp = sorted(prices.items(), key=lambda kv: kv[1][1])
-                cheap = sp[0][1][1]
-                for chain, (addr, price) in sp:
-                    spread = (price - cheap) / cheap * 100
-                    dex_url = _dexscreener_url(chain, addr)
-                    lines.append(
-                        f"<b>{chain.upper()}</b>: ${price:.6g} ({spread:+.2f}%) "
-                        f"<a href='{dex_url}'>→</a>"
-                    )
-            await q.message.answer("\n".join(lines), parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=True)
+            await q.message.answer(
+                f"<b>Mute a network for</b> <code>{cg_id}</code>\n"
+                f"<i>✅ = active (tap to mute) · 🚫 = muted (tap to "
+                f"un-mute).</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=await self._mute_kb(cg_id, group))
             await q.answer()
+
+        @dp.callback_query(F.data == "mnx:")
+        async def on_mute_close(q: CallbackQuery) -> None:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await q.answer()
+
+        @dp.callback_query(F.data.startswith("bln:"))
+        async def on_bln_btn(q: CallbackQuery) -> None:
+            leg = q.data.split(":", 1)[1].lower()  # "{cg_id}@{chain}"
+            cg_id = leg.split("@", 1)[0]
+            r = await get_redis()
+            if await r.sismember(_LEGBLACKLIST_KEY, leg):
+                await r.srem(_LEGBLACKLIST_KEY, leg)
+                await q.answer(f"✅ Un-muted: {leg}")
+            else:
+                await r.sadd(_LEGBLACKLIST_KEY, leg)
+                await q.answer(f"🚫 Muted: {leg}")
+            # Refresh the picker so the tapped chain flips colour in place.
+            group = await r.hgetall(f"cg2:group:{cg_id}")
+            if group:
+                try:
+                    await q.message.edit_reply_markup(
+                        reply_markup=await self._mute_kb(cg_id, group))
+                except Exception:
+                    pass
 
         @dp.callback_query(F.data.startswith("bl:"))
         async def on_bl_btn(q: CallbackQuery) -> None:
             cg_id = q.data.split(":", 1)[1].lower()
             r = await get_redis()
-            await r.sadd(_BLACKLIST_KEY, cg_id)
-            await q.answer(f"🚫 Blacklisted: {cg_id}", show_alert=True)
+            added = await r.sadd(_BLACKLIST_KEY, cg_id)
+            if added:
+                await q.answer(f"🚫 Blacklisted: {cg_id}", show_alert=True)
+            else:
+                await q.answer(f"ℹ️ Already blacklisted: {cg_id}",
+                               show_alert=True)
 
         @dp.callback_query(F.data.startswith("menu:"))
         async def on_menu(q: CallbackQuery) -> None:
@@ -366,15 +409,6 @@ class Alerter:
             elif action == "blacklist":
                 await q.message.answer(await self._blacklist_view(),
                                        parse_mode=ParseMode.HTML)
-            elif action == "check_hint":
-                await q.message.answer(
-                    "🔍 Send <code>/check &lt;cg_id&gt;</code> or "
-                    "<code>/check &lt;contract&gt;</code>\n\n"
-                    "Examples:\n"
-                    "<code>/check chainlink</code>\n"
-                    "<code>/check 0x514910771af9ca656af840dff83e8264ecf986ca</code>",
-                    parse_mode=ParseMode.HTML,
-                )
             elif action == "stop":
                 r = await get_redis()
                 await r.srem(_SUBSCRIBERS_KEY, str(q.from_user.id))
@@ -390,15 +424,12 @@ class Alerter:
         groups = 0
         async for _ in r.scan_iter(match="cg2:group:*", count=1000):
             groups += 1
-
         prices = 0
         async for _ in r.scan_iter(match="cc2:price:*", count=1000):
             prices += 1
-
         alerts_active = 0
         async for _ in r.scan_iter(match="cc2_alerted:*", count=1000):
             alerts_active += 1
-
         bl = await r.scard(_BLACKLIST_KEY)
 
         return (
@@ -411,207 +442,218 @@ class Alerter:
             f"⏸ Alerts in cooldown: <code>{alerts_active}</code>\n"
         )
 
-    # ── /check ────────────────────────────────────────────────────────────
-
-    async def _handle_check(self, msg: Message) -> None:
-        parts = (msg.text or "").strip().split()
-        if len(parts) < 2:
-            await msg.answer(
-                "Usage: <code>/check &lt;cg_id&gt;</code> or "
-                "<code>/check &lt;contract_addr&gt;</code>\n\n"
-                "Example: <code>/check chainlink</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        query = parts[1].strip().lower()
-        r = await get_redis()
-
-        # Try as contract address first
-        cg_id: str | None = None
-        if query.startswith("0x") and len(query) == 42:
-            # scan all chains
-            async for key in r.scan_iter(match=f"cg2:contract:*:{query}", count=100):
-                cg_id = await r.get(key)
-                if cg_id:
-                    break
-        else:
-            # treat as cg_id directly
-            if await r.exists(f"cg2:group:{query}"):
-                cg_id = query
-
-        if not cg_id:
-            await msg.answer(
-                f"❌ Not found: <code>{parts[1]}</code>\n\n"
-                f"Try a CoinGecko ID like <code>chainlink</code> or a contract.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        group = await r.hgetall(f"cg2:group:{cg_id}")
-        if not group:
-            await msg.answer(f"❌ Token group empty: <code>{cg_id}</code>",
-                             parse_mode=ParseMode.HTML)
-            return
-
-        # Fetch prices + on-chain liq for each chain
-        prices: dict[str, tuple[str, float, float | None]] = {}  # chain -> (addr, price, liq)
-        for chain, addr in group.items():
-            price = await get_price(chain, addr)
-            liq_raw = await r.get(f"cc2:liq_usd:{chain}:{addr.lower()}")
-            try:
-                liq = float(liq_raw) if liq_raw else None
-            except (TypeError, ValueError):
-                liq = None
-            if price and price > 0:
-                prices[chain] = (addr, price, liq)
-
-        bridges = sorted(await r.smembers(f"cg2:bridges:{cg_id}"))
-        bridge_str = " · ".join(b.upper() for b in bridges) if bridges else "—"
-
-        lines: list[str] = []
-        lines.append(f"🔍 <b>{cg_id.upper()}</b>  ·  <i>{len(prices)}/{len(group)} chains priced</i>")
-        lines.append(f"<b>Bridges:</b> <i>{bridge_str}</i>")
-        lines.append("")
-
-        if not prices:
-            lines.append("⚠️ No fresh prices yet — monitor hasn't cycled.")
-        else:
-            sorted_prices = sorted(prices.items(), key=lambda kv: kv[1][1])
-            cheapest_price = sorted_prices[0][1][1]
-
-            # Header row (monospaced via <code>)
-            lines.append(f"<code>CHAIN         PRICE         SPREAD     LIQ    </code>")
-            for chain, (addr, price, liq) in sorted_prices:
-                spread = (price - cheapest_price) / cheapest_price * 100
-                # spread tier dot
-                if spread < 0.5:    flag = "🟢"
-                elif spread < 5:    flag = "🟡"
-                elif spread < 30:   flag = "🔥"
-                elif spread < 200:  flag = "🚀"
-                else:               flag = "⚠️"
-                liq_e = _liq_emoji(liq)
-                spread_str = f"+{spread:.2f}%" if spread > 0 else "  base"
-                lines.append(
-                    f"{flag}<code>{chain.upper()[:11]:<11s} </code>"
-                    f"<code>${_fmt_price(price):>11s}</code>  "
-                    f"<code>{spread_str:>8s}</code>  "
-                    f"{liq_e}<code>{_fmt_money(liq):>7s}</code>  "
-                    f"<a href='{_dexscreener_url(chain, addr)}'>→</a>"
-                )
-
-        # Chains WITHOUT price
-        no_price = [c for c in group if c not in prices]
-        if no_price:
-            lines.append(f"\n<i>No price on:</i> {', '.join(no_price)}")
-
-        # Contracts on all chains (full addresses, copy-friendly)
-        lines.append(f"\n<b>Contracts:</b>")
-        for chain, addr in sorted(group.items()):
-            lines.append(f"<b>{chain.upper()}</b>  <code>{addr}</code>")
-
-        # Blacklist status
-        is_bl = await r.sismember(_BLACKLIST_KEY, cg_id)
-        if is_bl:
-            lines.append(f"\n🚫 <b>Blacklisted</b> — alerts suppressed")
-
-        await msg.answer(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-
     # ── /blacklist ────────────────────────────────────────────────────────
 
     async def _handle_blacklist(self, msg: Message) -> None:
         parts = (msg.text or "").strip().split()
         r = await get_redis()
 
-        if len(parts) == 1:
+        if len(parts) == 1 or parts[1].lower() == "list":
             await msg.answer(await self._blacklist_view(),
                              parse_mode=ParseMode.HTML)
             return
 
         action = parts[1].lower()
 
-        if action == "list":
-            await msg.answer(await self._blacklist_view(),
-                             parse_mode=ParseMode.HTML)
-            return
-
+        # An arg containing "@" targets a single leg (token@chain); plain
+        # arg targets the whole token.
         if action in ("add", "block", "+"):
             if len(parts) < 3:
-                await msg.answer("Usage: <code>/blacklist add &lt;cg_id&gt;</code>",
-                                 parse_mode=ParseMode.HTML)
+                await msg.answer(
+                    "Usage: <code>/blacklist add &lt;id&gt;</code> or "
+                    "<code>/blacklist add &lt;id&gt;@&lt;chain&gt;</code>",
+                    parse_mode=ParseMode.HTML)
                 return
-            cg_id = parts[2].lower()
-            await r.sadd(_BLACKLIST_KEY, cg_id)
-            await msg.answer(f"🚫 Blacklisted: <code>{cg_id}</code>",
-                             parse_mode=ParseMode.HTML)
+            tgt = parts[2].lower()
+            key = _LEGBLACKLIST_KEY if "@" in tgt else _BLACKLIST_KEY
+            added = await r.sadd(key, tgt)
+            kind = "Muted leg" if "@" in tgt else "Blacklisted"
+            await msg.answer(
+                (f"🚫 {kind}: <code>{tgt}</code>" if added
+                 else f"ℹ️ Already there: <code>{tgt}</code>"),
+                parse_mode=ParseMode.HTML)
             return
 
         if action in ("remove", "rm", "del", "-"):
             if len(parts) < 3:
-                await msg.answer("Usage: <code>/blacklist remove &lt;cg_id&gt;</code>",
-                                 parse_mode=ParseMode.HTML)
+                await msg.answer(
+                    "Usage: <code>/blacklist remove &lt;id|id@chain&gt;</code>",
+                    parse_mode=ParseMode.HTML)
                 return
-            cg_id = parts[2].lower()
-            removed = await r.srem(_BLACKLIST_KEY, cg_id)
-            if removed:
-                await msg.answer(f"✅ Unblocked: <code>{cg_id}</code>",
-                                 parse_mode=ParseMode.HTML)
-            else:
-                await msg.answer(f"Not on blacklist: <code>{cg_id}</code>",
-                                 parse_mode=ParseMode.HTML)
+            tgt = parts[2].lower()
+            key = _LEGBLACKLIST_KEY if "@" in tgt else _BLACKLIST_KEY
+            removed = await r.srem(key, tgt)
+            await msg.answer(
+                (f"✅ Removed: <code>{tgt}</code>" if removed
+                 else f"Not on list: <code>{tgt}</code>"),
+                parse_mode=ParseMode.HTML)
             return
 
         if action == "clear":
-            await r.delete(_BLACKLIST_KEY)
-            await msg.answer("🧹 Blacklist cleared.")
+            await r.delete(_BLACKLIST_KEY, _LEGBLACKLIST_KEY)
+            await msg.answer("🧹 Blacklist + leg mutes cleared.")
             return
 
-        # Single-arg treat as "add this token"
-        cg_id = action
-        await r.sadd(_BLACKLIST_KEY, cg_id)
-        await msg.answer(f"🚫 Blacklisted: <code>{cg_id}</code>",
-                         parse_mode=ParseMode.HTML)
+        tgt = action
+        key = _LEGBLACKLIST_KEY if "@" in tgt else _BLACKLIST_KEY
+        added = await r.sadd(key, tgt)
+        kind = "Muted leg" if "@" in tgt else "Blacklisted"
+        await msg.answer(
+            (f"🚫 {kind}: <code>{tgt}</code>" if added
+             else f"ℹ️ Already there: <code>{tgt}</code>"),
+            parse_mode=ParseMode.HTML)
 
     async def _blacklist_view(self) -> str:
         r = await get_redis()
-        items = await r.smembers(_BLACKLIST_KEY)
-        if not items:
+        items = sorted(await r.smembers(_BLACKLIST_KEY) or [])
+        legs = sorted(await r.smembers(_LEGBLACKLIST_KEY) or [])
+        if not items and not legs:
             return (
                 "🚫 <b>Blacklist</b> — empty\n\n"
-                "Add a token: <code>/blacklist add &lt;cg_id&gt;</code>\n"
-                "Remove:       <code>/blacklist remove &lt;cg_id&gt;</code>\n"
-                "Clear all:    <code>/blacklist clear</code>"
+                "Token: <code>/blacklist add &lt;id&gt;</code>\n"
+                "Network: <code>/blacklist add &lt;id&gt;@&lt;chain&gt;</code>\n"
+                "Remove: <code>/blacklist remove &lt;id|id@chain&gt;</code>\n"
+                "Clear: <code>/blacklist clear</code>"
             )
-        lines = [f"🚫 <b>Blacklist</b> ({len(items)} tokens)\n━━━━━━━━━━━━━"]
-        for it in sorted(items):
-            lines.append(f"  <code>{it}</code>")
+        lines = [f"🚫 <b>Blacklist</b>"]
+        if items:
+            lines.append(f"\n<b>Tokens ({len(items)}):</b>")
+            lines += [f"  <code>{i}</code>" for i in items]
+        if legs:
+            lines.append(f"\n<b>Muted networks ({len(legs)}):</b>")
+            lines += [f"  <code>{l}</code>" for l in legs]
         lines.append(
-            "\n<i>Remove:</i> <code>/blacklist remove &lt;cg_id&gt;</code>\n"
-            "<i>Clear all:</i> <code>/blacklist clear</code>"
-        )
+            "\n<i>Remove:</i> <code>/blacklist remove &lt;id|id@chain&gt;</code>")
         return "\n".join(lines)
 
     async def is_blacklisted(self, cg_id: str) -> bool:
         r = await get_redis()
         return bool(await r.sismember(_BLACKLIST_KEY, cg_id.lower()))
 
+    # ── /check ────────────────────────────────────────────────────────────
+
+    async def _resolve_query(self, q: str) -> list[str]:
+        """Resolve a /check arg to group id(s). Accepts: exact group id,
+        wh-<symbol>, a contract address (any chain), or a ticker."""
+        r = await get_redis()
+        q = q.strip()
+        ql = q.lower()
+
+        for cand in (q, ql, f"wh-{ql}"):
+            if await r.exists(f"cg2:group:{cand}"):
+                return [cand]
+
+        # contract address (EVM 0x..., or non-EVM with :: / long base58)
+        if q.startswith("0x") or "::" in q or len(q) >= 30:
+            na = norm_addr(q)
+            gids: list[str] = []
+            async for k in r.scan_iter(match=f"cg2:contract:*:{na}", count=500):
+                v = await r.get(k)
+                if v:
+                    gids.append(v.decode() if isinstance(v, bytes) else v)
+            if gids:
+                return list(dict.fromkeys(gids))
+
+        # ticker → symbol index
+        members = await r.smembers(f"cg2:sym:{ql}")
+        out = []
+        for m in (members or []):
+            m = m.decode() if isinstance(m, bytes) else m
+            if await r.exists(f"cg2:group:{m}"):
+                out.append(m)
+        return out
+
+    async def _check_text(self, query: str) -> str:
+        r = await get_redis()
+        gids = await self._resolve_query(query)
+        if not gids:
+            return (f"❌ Not found: <code>{query}</code>\n\n"
+                    "Try a ticker (<code>ADS</code>), id "
+                    "(<code>adshares</code>) or a contract.")
+
+        # If a ticker matched several projects, pick the one with the most
+        # chains (most likely the real multichain token).
+        note = ""
+        if len(gids) > 1:
+            sizes = []
+            for g in gids:
+                sizes.append((await r.hlen(f"cg2:group:{g}"), g))
+            sizes.sort(reverse=True)
+            gid = sizes[0][1]
+            note = (f"\n<i>{len(gids)} matches for that ticker — showing "
+                    f"<code>{gid}</code>. Others: "
+                    + ", ".join(f"<code>{g}</code>" for _, g in sizes[1:6])
+                    + "</i>")
+        else:
+            gid = gids[0]
+
+        group = await r.hgetall(f"cg2:group:{gid}")
+        if not group:
+            return f"❌ Group empty: <code>{gid}</code>"
+
+        rows: list[tuple[str, str, float | None, float | None]] = []
+        async with r.pipeline(transaction=False) as pipe:
+            for chain, addr in group.items():
+                pipe.get(f"cc2:price:{chain}:{norm_addr(addr)}")
+                pipe.get(f"cc2:liq_usd:{chain}:{norm_addr(addr)}")
+            vals = await pipe.execute()
+        for i, (chain, addr) in enumerate(group.items()):
+            try:    price = float(vals[i*2]) if vals[i*2] else None
+            except: price = None
+            try:    liq = float(vals[i*2+1]) if vals[i*2+1] else None
+            except: liq = None
+            rows.append((chain, addr, price, liq))
+
+        priced = sorted([x for x in rows if x[2]], key=lambda x: x[2])
+        bridges = await _bridges_for(gid)
+        br = " · ".join(b.upper() for b in bridges) if bridges else "—"
+
+        lines = [f"🔍 <b>{gid}</b>  ·  <i>{len(priced)}/{len(group)} priced</i>",
+                 f"<b>Bridges:</b> <i>{br}</i>", ""]
+        if not priced:
+            lines.append("⚠️ No fresh prices (monitor hasn't covered it / "
+                         "no live pool).")
+        else:
+            base = priced[0][2]
+            for chain, addr, price, liq in priced:
+                spr = (price - base) / base * 100
+                spr_s = f"+{spr:.2f}%" if spr > 0 else "  base"
+                lines.append(
+                    f"{_liq_emoji(liq)} <a href='{_dexscreener_url(chain, addr)}'>"
+                    f"{chain.upper()}</a>  <b>${_fmt_price(price)}</b>  "
+                    f"{spr_s}  {_fmt_money(liq)}")
+            if len(priced) >= 2:
+                spread = (priced[-1][2] - base) / base * 100
+                lines.append(f"\n<b>Max spread: {spread:.2f}%</b>")
+        priced_chains = {x[0] for x in priced}
+        no_p = [c for c, _a, _p, _l in rows if c not in priced_chains]
+        if no_p:
+            lines.append(f"\n<i>No price:</i> {', '.join(sorted(no_p))}")
+        lines.append("\n<b>Contracts:</b>")
+        for chain, addr in sorted(group.items()):
+            lines.append(f"<b>{chain.upper()}</b> <code>{addr}</code>")
+        if await self.is_blacklisted(gid):
+            lines.append("\n🚫 <b>Blacklisted</b>")
+        return "\n".join(lines) + note
+
     # ── Broadcasting ──────────────────────────────────────────────────────
 
     async def send(self, opp: CrossChainOpportunity) -> None:
-        # Respect blacklist
         if await self.is_blacklisted(opp.cg_id):
             log.info("alerter.skipped_blacklisted", cg_id=opp.cg_id)
             return
 
-        bridges = await get_bridges_for(opp.cg_id)
-        text = await self._format(opp, bridges)
+        bridges = await _bridges_for(opp.cg_id)
+        other_chains = await self._collect_other_chains(opp)
+        r = await get_redis()
+        legs = await r.smembers(_LEGBLACKLIST_KEY) or set()
+        pref = f"{opp.cg_id.lower()}@"
+        muted_chains = sorted(m[len(pref):] for m in legs
+                              if m.startswith(pref))
+        text = _build_alert_text(opp, bridges, other_chains, muted_chains)
         kb = self._alert_keyboard(opp)
         log.info("alerter.broadcasting",
-                 cg_id=opp.cg_id, net_pct=opp.net_profit_pct)
+                 cg_id=opp.cg_id, spread_pct=opp.gross_spread_pct)
 
         if self._dry_run:
             log.info("alerter.dry_run", text=text)
@@ -629,7 +671,6 @@ class Alerter:
 
         async def _send_one(chat_id: str) -> None:
             async with sem:
-                # Try 1: HTML + keyboard
                 try:
                     await self._bot.send_message(
                         chat_id=chat_id, text=text,
@@ -648,12 +689,9 @@ class Alerter:
                         return
                     log.warning("alerter.send_failed_html",
                                 chat_id=chat_id, err=err[:200])
-
-                # Try 2: plain text fallback (no HTML / no keyboard)
                 try:
-                    plain = _strip_html(text)
                     await self._bot.send_message(
-                        chat_id=chat_id, text=plain,
+                        chat_id=chat_id, text=_strip_html(text),
                         disable_web_page_preview=True,
                     )
                     stats["sent"] += 1
@@ -666,82 +704,93 @@ class Alerter:
         log.info("alerter.broadcast_complete",
                  cg_id=opp.cg_id, sent=stats["sent"], failed=stats["failed"])
 
+    async def _mute_kb(self, cg_id: str,
+                       group: dict[str, str]) -> InlineKeyboardMarkup:
+        r = await get_redis()
+        muted = await r.smembers(_LEGBLACKLIST_KEY) or set()
+        row, kb = [], []
+        for ch in sorted(group):
+            on = f"{cg_id.lower()}@{ch}" in muted
+            row.append(InlineKeyboardButton(
+                text=f"{'🚫' if on else '✅'} {_chain_label(ch)}",
+                callback_data=f"bln:{cg_id}@{ch}"))
+            if len(row) == 3:
+                kb.append(row); row = []
+        if row:
+            kb.append(row)
+        kb.append([InlineKeyboardButton(text="⬅ Back",
+                                        callback_data="mnx:")])
+        return InlineKeyboardMarkup(inline_keyboard=kb)
+
     def _alert_keyboard(self, opp: CrossChainOpportunity) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"🛒 {opp.cheap_chain.upper()} pool",
-                    url=_dexscreener_url(opp.cheap_chain, opp.cheap_addr),
+                    text=f"{_chain_label(opp.cheap_chain)} OKX",
+                    url=_okx_url(opp.cheap_chain, opp.cheap_addr),
                 ),
                 InlineKeyboardButton(
-                    text=f"💸 {opp.expensive_chain.upper()} pool",
-                    url=_dexscreener_url(opp.expensive_chain, opp.expensive_addr),
+                    text=f"{_chain_label(opp.expensive_chain)} OKX",
+                    url=_okx_url(opp.expensive_chain, opp.expensive_addr),
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="📊 All chains",
-                    callback_data=f"check:{opp.cg_id}",
+                    text="BL Net",
+                    callback_data=f"mn:{opp.cg_id}",
                 ),
                 InlineKeyboardButton(
-                    text="🚫 Blacklist this",
+                    text="BL Token",
                     callback_data=f"bl:{opp.cg_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Info",
+                    url=_researcher_url(opp.ticker, opp.cg_id),
                 ),
             ],
         ])
 
-    async def _format(self, opp: CrossChainOpportunity, bridges: list[str] | None = None) -> str:
-        bridges = bridges or []
-        other_chains = await self._collect_other_chains(opp)
-        return _build_alert_text(opp, bridges, other_chains)
-
     async def _collect_other_chains(
         self, opp: CrossChainOpportunity,
     ) -> list[tuple[str, str, float | None, float | None]]:
-        """All chains in the group EXCEPT cheap/expensive — for context display."""
         r = await get_redis()
         group = await r.hgetall(f"cg2:group:{opp.cg_id}")
         if not group:
             return []
-        # Filter out the two chains already shown in DEX table
         other = [(c, a) for c, a in group.items()
                  if c not in (opp.cheap_chain, opp.expensive_chain)]
         if not other:
             return []
-        # Pipelined fetch: price + liq for each
         async with r.pipeline(transaction=False) as pipe:
             for c, a in other:
-                pipe.get(f"cc2:price:{c}:{a.lower()}")
-                pipe.get(f"cc2:liq_usd:{c}:{a.lower()}")
+                pipe.get(f"cc2:price:{c}:{norm_addr(a)}")
+                pipe.get(f"cc2:liq_usd:{c}:{norm_addr(a)}")
             vals = await pipe.execute()
         rows: list[tuple[str, str, float | None, float | None]] = []
         for i, (c, a) in enumerate(other):
             try:    price = float(vals[i*2]) if vals[i*2] else None
             except: price = None
-            try:    liq   = float(vals[i*2+1]) if vals[i*2+1] else None
-            except: liq   = None
+            try:    liq = float(vals[i*2+1]) if vals[i*2+1] else None
+            except: liq = None
             rows.append((c, a, price, liq))
-        # Sort: priced chains first (by price asc to show spread), then unpriced
         rows.sort(key=lambda x: (x[2] is None, x[2] or 0))
         return rows
 
 
 def _help_text() -> str:
     return (
-        "ℹ️ <b>Cross-Chain Arb Bot</b>\n"
+        "ℹ️ <b>Cross-Chain Spread Bot</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Real-time scanner comparing token prices across 20+ chains.\n\n"
+        "Scans the same token's price across 20+ chains and alerts on gaps.\n\n"
         "<b>Commands:</b>\n"
         "/start — subscribe to alerts\n"
         "/status — scanner stats\n"
-        "/check &lt;id|addr&gt; — show all prices for a token\n"
+        "/check &lt;ticker|id|contract&gt; — all chains for a token\n"
         "/blacklist — view blocklist\n"
-        "/blacklist add &lt;id&gt; — mute alerts for token\n"
+        "/blacklist add &lt;id&gt; — mute a token\n"
         "/blacklist remove &lt;id&gt; — unmute\n"
         "/blacklist clear — wipe\n"
-        "/stop — unsubscribe\n\n"
-        "<b>Alert buttons:</b>\n"
-        "Every alert has quick links to DexScreener pools on both chains, "
-        "an <i>All chains</i> button to see every price, and "
-        "<i>Blacklist this</i> to mute further alerts for that token."
+        "/stop — unsubscribe"
     )

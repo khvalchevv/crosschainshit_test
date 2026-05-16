@@ -1,80 +1,32 @@
 arbitrage:
-  # FLOOR for net spread after bridge — actual gate is dynamic (per-pool, scales
-  # with expected slippage on smaller side). 4% is the absolute minimum below
-  # which alerts are noise even on deepest pools.
-  min_profit_percent: 4.0
-  # sanity cap — only above this do we assume data error.
+  # Minimum spread % to alert.
+  min_profit_percent: 6.0
+  # Sanity cap — above this we assume a data error, not a real spread.
   max_profit_percent: 500.0
-  # assumed trade size for $-profit calculations
+  # Assumed trade size, only used for the $-amount shown in alerts.
   trade_size_usd: 10000
-  # cooldown bucketed by spread magnitude (5%-buckets) — same token+pair re-alerts
-  # if spread jumps to a meaningfully different bucket within the window.
-  alert_cooldown_sec: 3600
-  # Max age of a spread to still be considered "fresh" and alertable.
-  max_spread_age_sec: 1800  # 30 min
-  # Warmup period at startup — bot does NOT alert, just lets prices populate.
-  warmup_minutes: 1
-  # Optional last-mile aggregator check before alert. KyberSwap quotes a real
-  # route on each side; alert killed if either side has no route or slippage
-  # > kyberswap_max_slippage_pct. Adds ~2-3s per alert. Disable if KyberSwap
-  # rate-limits become an issue.
-  kyberswap_verify_enabled: true
-  kyberswap_max_slippage_pct: 5.0
+  # Per (token, chain-pair, 5%-bucket) cooldown.
+  alert_cooldown_sec: 180
+  # Startup grace period — populate prices, don't alert yet.
+  warmup_sec: 60
 
 monitor:
-  # Polling cycle — drives the full pipeline (DefiLlama batch → DS/OKX/GT/Jup
-  # gap-fill → Redis write). Lower = fresher prices, higher = less proxy load.
-  # 10s is comfortably under price_ttl_sec and well within proxy budget.
-  interval_sec: 10
-  # Min liquidity required for a DS pool to be USED as price source. Below
-  # this we skip the pool — its "price" is meaningless on a $50 pool.
+  # Bridged-token registry (Wormhole + LayerZero), merged with CoinGecko.
+  registry_file: data/all_bridged_tokens.json
+  # Price polling cycle. ~5s is the practical floor — one full sweep of all
+  # addresses through the proxy pool takes ~3-7s; lower just hammers the
+  # free APIs into rate-limit bans and tanks coverage.
+  interval_sec: 5
+  # Detector is event-driven (fires the instant the monitor finishes a
+  # sweep). This is only the safety-net timeout if the wake event is missed.
+  detector_interval_sec: 15
+  # Min DS pool liquidity for its price to be USED at all.
   min_pool_liquidity_usd: 500
-  # Min liquidity required for ALERT — set to 2× trade_size to keep slippage
-  # tolerable. Below this any "spread" we see won't actually execute at size.
-  alert_min_pool_liquidity_usd: 10000
-  # Min 24h volume required for MATURE pools (>24h old).
-  alert_min_pool_volume_usd: 2000
-  # New-pool age cutoff — pools younger get vol threshold = new_pool_min_volume_usd.
-  new_pool_max_age_hours: 24
-  new_pool_min_volume_usd: 500
-  # DexScreener batch size (max allowed)
+  # Min liquidity on BOTH sides required to fire an alert.
+  alert_min_pool_liquidity_usd: 5000
+  # DexScreener batch size (max allowed).
   batch_size: 30
-  # parallel DexScreener requests — most of the 1000-proxy pool, leaving headroom
-  # for verifier/llama/gt/okx/jup concurrent traffic.
+  # Parallel DexScreener requests (most of the proxy pool).
   parallel_requests: 800
-  # Per-price Redis TTL — MUST be > interval_sec so prices don't disappear
-  # between cycles.
+  # Per-price Redis TTL — must be > interval_sec.
   price_ttl_sec: 60
-  # Delay between initial detection and verification re-query (seconds).
-  # Short delay catches stale-spread false positives from cycle-old data.
-  verify_delay_sec: 1
-
-bridge:
-  # default bridge fee as % of notional
-  default_fee_percent: 0.15
-  # gas cost estimates per chain in USD
-  gas_usd:
-    ethereum:  8.0
-    bsc:       0.5
-    polygon:   0.1
-    arbitrum:  0.3
-    base:      0.2
-    optimism:  0.3
-    avalanche: 0.3
-    fantom:    0.1
-    zksync:    0.5
-    linea:     0.3
-    blast:     0.3
-    scroll:    0.3
-    mantle:    0.3
-    berachain: 0.3
-    celo:      0.2
-    cronos:    0.2
-    moonbeam:  0.2
-    gnosis:    0.1
-    solana:    1.0
-    sui:       1.0
-    aptos:     1.0
-    tron:      1.0
-    near:      0.5
-    tezos:     0.5

@@ -1,97 +1,81 @@
-# Cross-chain Arbitrage Scanner — Setup
+# Cross-Chain Spread Scanner — Setup
 
-Real-time cross-chain arbitrage scanner across 55 EVM + non-EVM chains. On-chain price reading (Uniswap V2/V3/V4), DexScreener / DefiLlama / GeckoTerminal fallbacks, Telegram alerting.
+Real-time scanner that detects the same token trading at different prices
+across chains and alerts via Telegram. It does **not** execute or check
+bridges — it only surfaces the spread (bridge feasibility is a separate
+concern).
+
+No paid API keys. Price data is free & keyless (DexScreener +
+GeckoTerminal); throughput comes from a proxy pool, not API plans.
+
+## How it works
+
+```
+REGISTRY   CoinGecko coins/list  +  data/all_bridged_tokens.json
+           (Wormhole + LayerZero)        →  cg2:group:{id} = {chain: addr}
+
+MONITOR    every interval_sec: all addresses → DexScreener (price + liq),
+           GeckoTerminal as price-only fallback  →  cc2:price:* (TTL)
+
+DETECTOR   every detector_interval_sec: per group spread = (max-min)/min;
+           ≥ min_profit_percent  AND  both pools ≥ alert liquidity  AND
+           not on cooldown  AND  not blacklisted  →  Telegram alert
+```
 
 ## Prerequisites
 
-### 1. Python 3.11+
-```bash
-python --version   # must be >= 3.11
-```
-
-### 2. Redis
-- **Windows:** install [Memurai](https://www.memurai.com/get-memurai) (free Redis-compatible server). Runs on default port 6379.
-- **macOS:** `brew install redis && brew services start redis`
-- **Linux:** `sudo apt install redis-server && sudo systemctl start redis`
-
-Sanity check:
-```bash
-redis-cli ping     # → PONG
-```
-
-### 3. Alchemy API keys
-Required for on-chain price reading (Uniswap V2/V3/V4 via Multicall3).
-- Sign up at https://dashboard.alchemy.com (PAYG plan — free tier is rate-limited)
-- Create 1-3 apps (any single app covers all supported chains)
-- Multiple keys = round-robin parallelism across RPC calls — noticeably faster
-
-### 4. Telegram bot
-- Create bot via [@BotFather](https://t.me/BotFather) → get token
-- `TELEGRAM_CHAT_ID` can be left blank — the bot broadcasts to every user that runs `/start`
-
-### 5. Proxies (optional but strongly recommended)
-For DexScreener + CoinMarketCap throughput. Without proxies you'll hit rate limits fast.
-- Any HTTP proxy list in `http://user:pass@host:port` format, one per line
-- Tested with [Webshare](https://www.webshare.io) residential plan
-- Place file at `data/proxies.txt`
+1. **Python 3.12** (3.13 lacks prebuilt wheels for the pinned deps).
+2. **Redis** on `localhost:6379` (Memurai on Windows, or a portable
+   `redis-server.exe`). DB index 1 by default.
+3. **Telegram bot token** from [@BotFather](https://t.me/BotFather).
+4. **Proxies** (recommended) — `data/proxies.txt`, one per line, either
+   `http://user:pass@host:port` or webshare `host:port:user:pass`.
 
 ## Install
 
 ```bash
-git clone <repo_url> crosschain_arb
-cd crosschain_arb
-
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/Mac: source .venv/bin/activate
-
+.venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 
 cp .env.example .env
-# edit .env: fill TELEGRAM_BOT_TOKEN, ALCHEMY_KEYS
+# edit .env: set TELEGRAM_BOT_TOKEN
 ```
 
-## First run
+## Run
 
-One-off: populate the token mapper (CoinGecko + LayerZero + bridge registries).
-```bash
-python scripts/refresh_tokens.py       # CoinGecko + LayerZero
-python scripts/refresh_cmc.py          # CoinMarketCap (optional, ~5 min, adds ~1500 tokens)
-python scripts/refresh_bridges.py      # LiFi, Axelar, Wormhole, Across, Symbiosis
-```
-
-Then start the bot:
 ```bash
 python main.py
 ```
 
-On first start the bot:
-1. Loads token mappings from Redis
-2. Warms up on-chain pool discovery (~10-15 min — discovers V2/V3/V4 pools for each token across chains)
-3. Indexes Uniswap V4 Initialize events on 13 chains (~20-30 min, one-time, resumable)
-4. Starts monitor + detector loops
+On startup the bot builds the registry (CoinGecko + bridged JSON), then
+runs the monitor + detector loops. It re-refreshes the registry every 24h.
+To force an immediate registry rebuild:
 
-Alerts appear in Telegram to every user who has sent `/start` to the bot.
+```bash
+python scripts/refresh_registry.py
+```
 
-## Bot commands (Telegram)
+Alerts go to every user who has sent `/start` to the bot.
+
+## Telegram commands
 
 - `/start` — subscribe to alerts
-- `/check <cg_id|contract_addr>` — show current prices for a token across all chains the bot knows it on
-- `/blacklist add <cg_id>` — suppress alerts for a token
-- `/blacklist remove <cg_id>` — unblock
-- `/blacklist list` — show blacklist
+- `/status` — scanner stats
+- `/blacklist add <id>` — mute a token (`remove`, `list`, `clear`)
+- `/stop` — unsubscribe
 
-## Tuning
+## Tuning — `config/thresholds.yaml`
 
-Edit `config/thresholds.yaml`:
-- `min_profit_percent` (default 6.0) — minimum net spread (after bridge costs) to alert
-- `alert_min_pool_liquidity_usd` (default 1000) — skip pools below this
-- `alert_min_pool_volume_usd` (default 1000) — skip stale pools
-- `monitor.interval_sec` (default 5) — monitor loop pacing; cycle itself takes ~20-25s for 12k addresses
-- `alert_cooldown_sec` (default 86400) — cooldown per token+chain-pair
+- `min_profit_percent` (4.0) — minimum spread to alert
+- `alert_min_pool_liquidity_usd` (10000) — both pools must clear this
+- `min_pool_liquidity_usd` (500) — below this a pool's price is ignored
+- `interval_sec` (10) — price polling cadence
+- `detector_interval_sec` (60) — spread scan cadence
+- `alert_cooldown_sec` (3600) — per token+chain-pair+spread-bucket
 
 ## Notes
 
-- Data lives in Redis DB 1 by default. Use a dedicated DB if running other projects on the same Redis.
-- Token mapping is cached in Redis for 7 days. Re-run `refresh_tokens.py` weekly to pick up new listings.
-- Uniswap V4 pool indexer is resumable — it tracks per-chain cursors in Redis key `cc2:v4_indexer_progress`.
+- Data lives in Redis DB 1. Registry cached 7 days; auto-refreshed every 24h.
+- `data/all_bridged_tokens.json` is the Wormhole+LayerZero registry — refresh
+  it from your source periodically to pick up new bridged tokens.

@@ -14,7 +14,7 @@ from typing import Any
 
 import aiohttp
 
-from utils import get_logger, get_proxy_manager, get_redis
+from utils import get_logger, get_proxy_manager, get_redis, norm_addr
 
 log = get_logger(__name__)
 
@@ -122,7 +122,7 @@ class GeckoTerminalClient:
         out: dict[tuple[str, str], float] = {}
 
         # ── Cache read ────────────────────────────────────────────────────
-        cache_keys = [f"cc2:gt_cache:{c}:{a.lower()}" for c, a in queries]
+        cache_keys = [f"cc2:gt_cache:{c}:{norm_addr(a)}" for c, a in queries]
         if cache_keys:
             async with r.pipeline(transaction=False) as pipe:
                 for k in cache_keys:
@@ -132,12 +132,12 @@ class GeckoTerminalClient:
                 if v is None:
                     continue
                 try:
-                    out[(chain, addr.lower())] = float(v)
+                    out[(chain, norm_addr(addr))] = float(v)
                 except (TypeError, ValueError):
                     continue
 
         # ── Determine misses ──────────────────────────────────────────────
-        misses = [(c, a) for c, a in queries if (c, a.lower()) not in out]
+        misses = [(c, a) for c, a in queries if (c, norm_addr(a)) not in out]
         if not misses:
             return out
 
@@ -147,7 +147,7 @@ class GeckoTerminalClient:
             net = _GT_NETWORK_MAP.get(chain)
             if not net:
                 continue
-            by_net.setdefault(net, []).append(addr.lower())
+            by_net.setdefault(net, []).append(norm_addr(addr))
 
         if not by_net:
             return out
@@ -216,5 +216,5 @@ class GeckoTerminalClient:
             except (TypeError, ValueError):
                 continue
             if price > 0:
-                out[(network, addr.lower())] = price
+                out[(network, norm_addr(addr))] = price
         return out

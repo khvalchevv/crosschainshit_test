@@ -10,6 +10,25 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
+def _normalize(line: str) -> str:
+    """Accept any of:
+        http://user:pass@host:port      (already valid — passthrough)
+        host:port:user:pass             (webshare — most common)
+        user:pass@host:port             (add scheme only)
+        host:port                       (add scheme only)
+    and return a aiohttp-valid `scheme://[user:pass@]host:port`.
+    """
+    if "://" in line:
+        return line
+    if "@" in line:
+        return f"http://{line}"
+    parts = line.split(":")
+    if len(parts) == 4:  # webshare host:port:user:pass
+        host, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return f"http://{line}"  # host:port (no auth)
+
+
 class ProxyManager:
     def __init__(self, proxies: list[str]) -> None:
         self._proxies = proxies
@@ -31,9 +50,7 @@ class ProxyManager:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if "://" not in line:
-                line = f"http://{line}"
-            proxies.append(line)
+            proxies.append(_normalize(line))
         return cls(proxies)
 
     def next(self) -> str | None:

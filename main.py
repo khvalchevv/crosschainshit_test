@@ -10,8 +10,6 @@ from core import (
     CrossChainMonitor,
     CrossChainOpportunity,
     TokenMapper,
-    merge_duplicate_groups,
-    refresh_all_bridges,
 )
 from utils import close_redis, get_logger, get_redis, setup_logging
 
@@ -36,16 +34,11 @@ class CrossChainScanner:
         await get_redis()
         await self._alerter.setup()
 
-        log.info("scanner.refreshing_tokens")
-        await self._mapper.refresh()
+        log.info("scanner.refreshing_registry")
+        stats = await self._mapper.refresh()
+        log.info("scanner.registry_ready", **stats)
 
-        log.info("scanner.merging_duplicate_groups")
-        stats = await merge_duplicate_groups()
-        log.info("scanner.merge_done", **stats)
-
-        # Periodic token-mapper refresh — without this, cg2:group:* keys silently
-        # expire after 7 days and multichain count drifts down.
-        asyncio.create_task(self._periodic_refresh_loop(), name="token_refresh")
+        asyncio.create_task(self._periodic_refresh_loop(), name="registry_refresh")
 
         self._running = True
         self._tasks = [
@@ -82,16 +75,14 @@ class CrossChainScanner:
             log.error("scanner.alert_error", err=str(e))
 
     async def _periodic_refresh_loop(self) -> None:
-        """Refresh CG/CMC/bridges every 24h so cg2:group:* never silently
-        decays from TTL expiry."""
+        """Re-refresh the registry every 24h so cg2:group:* never decays
+        from the 7-day TTL."""
         while self._running:
             await asyncio.sleep(24 * 3600)
             try:
                 log.info("scanner.periodic_refresh.start")
-                cg_lz = await self._mapper.refresh(force=True)
-                bridges = await refresh_all_bridges()
-                log.info("scanner.periodic_refresh.done",
-                         cg_lz=cg_lz, bridges=bridges)
+                stats = await self._mapper.refresh(force=True)
+                log.info("scanner.periodic_refresh.done", **stats)
             except Exception as e:
                 log.warning("scanner.periodic_refresh.err", err=str(e)[:120])
 
