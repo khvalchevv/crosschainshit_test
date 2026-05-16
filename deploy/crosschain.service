@@ -22,6 +22,9 @@ ExecStart=/opt/crosschainshit_test/.venv/bin/python main.py
 Restart=always
 RestartSec=5
 User=ubuntu
+# High concurrency (Redis pool + aiohttp + GT/Jupiter). Default 1024 FDs
+# causes "Error 24 / too many open files" under load.
+LimitNOFILE=1048576
 # Optional hardening
 NoNewPrivileges=true
 
