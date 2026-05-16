@@ -1,0 +1,29 @@
+# systemd unit for the crosschain spread scanner.
+#
+# Install:
+#   sudo cp deploy/crosschain.service /etc/systemd/system/crosschain.service
+#   # edit WorkingDirectory / ExecStart / User below to match your paths
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now crosschain
+#   journalctl -u crosschain -f          # live logs
+#
+# Restart=always → survives crashes/reboots. Same Telegram token must run
+# on ONLY ONE instance at a time (stop any local bot first).
+
+[Unit]
+Description=crosschain spread scanner
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crosschainshit_test
+ExecStart=/opt/crosschainshit_test/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+User=ubuntu
+# Optional hardening
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
