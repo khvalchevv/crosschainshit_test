@@ -292,9 +292,9 @@ class CrossChainDetector:
                 return 0.0
         cheap_liq, exp_liq = _f(liq_raw[0]), _f(liq_raw[1])
         if cheap_liq < self._alert_min_liq or exp_liq < self._alert_min_liq:
-            log.info("cc_detector.killed_low_liq", cg_id=cg_id,
-                     cheap_liq=round(cheap_liq), exp_liq=round(exp_liq),
-                     min_liq=self._alert_min_liq)
+            log.debug("cc_detector.killed_low_liq", cg_id=cg_id,
+                      cheap_liq=round(cheap_liq), exp_liq=round(exp_liq),
+                      min_liq=self._alert_min_liq)
             return False
 
         # Cooldown — bucketed by 5% spread so a meaningfully bigger jump
