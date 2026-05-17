@@ -183,6 +183,55 @@ class GeckoTerminalClient:
 
         return out
 
+    async def fetch_liquidity(self, chain: str, addr: str) -> float:
+        """Deepest-pool reserve (USD) for a token on `chain`, via the
+        per-token /pools endpoint. The batch price endpoint has no liquidity,
+        so GT-priced legs land with no liq; the detector calls this ONLY for
+        candidate legs (bounded volume), cached so repeated cycles are cheap.
+        Returns 0.0 on miss/failure. Also mirrors into cc2:liq_usd so /check
+        and other readers see it instead of '?'."""
+        net = _GT_NETWORK_MAP.get(chain)
+        if not net:
+            return 0.0
+        a = norm_addr(addr)
+        r = await get_redis()
+        ck = f"cc2:gt_liq:{net}:{a}"
+        cached = await r.get(ck)
+        if cached is not None:
+            try:
+                return float(cached)
+            except (TypeError, ValueError):
+                return 0.0
+
+        url = (f"https://api.geckoterminal.com/api/v2/networks/"
+               f"{net}/tokens/{a}/pools")
+        proxy = self._proxies.next()
+        session = await self._get_session()
+        kwargs: dict[str, Any] = {"proxy": proxy} if proxy else {}
+        liq = 0.0
+        try:
+            async with session.get(url, **kwargs) as resp:
+                if resp.status == 200:
+                    body = await resp.json(content_type=None)
+                    for pool in (body.get("data") or []):
+                        try:
+                            rv = float((pool.get("attributes") or {})
+                                       .get("reserve_in_usd") or 0)
+                        except (TypeError, ValueError):
+                            rv = 0.0
+                        if rv > liq:
+                            liq = rv
+        except Exception:
+            liq = 0.0
+
+        # Cache the result (even 0 — avoids re-hammering dead tokens).
+        async with r.pipeline(transaction=False) as pipe:
+            pipe.setex(ck, _CACHE_TTL_SEC, str(liq))
+            if liq > 0:
+                pipe.setex(f"cc2:liq_usd:{chain}:{a}", 180, str(liq))
+            await pipe.execute()
+        return liq
+
     async def _fetch_batch(
         self,
         sem: asyncio.Semaphore,

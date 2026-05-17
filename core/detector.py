@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
 from config import get_thresholds
+from core.geckoterminal import GeckoTerminalClient
 from core.monitor import _EXCLUDED_CHAINS
 from utils import get_logger, get_redis, norm_addr
 
@@ -67,6 +68,18 @@ def _symbol_of(cg_id: str) -> str:
     return base.replace("-", " ").title()
 
 
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def _sane(price: float, med: float, factor: float) -> bool:
+    """True if `price` is within [med/factor, med*factor] — i.e. not a
+    junk/fabricated outlier vs the group median."""
+    return med > 0 and (med / factor) <= price <= (med * factor)
+
+
 class CrossChainDetector:
     def __init__(
         self,
@@ -87,10 +100,15 @@ class CrossChainDetector:
         self._interval_sec   : int   = mon.get("detector_interval_sec", 60)
         self._alert_min_liq  : float = mon.get(
             "alert_min_pool_liquidity_usd", 10000)
+        # A leg whose price is >Nx (or <1/N) the group median is a junk /
+        # fabricated-fallback price (e.g. GeckoTerminal inventing a price for
+        # a chain with no real pool) — dropped before pairing.
+        self._max_dev        : float = cfg.get("max_price_deviation_x", 5.0)
+        self._gt = GeckoTerminalClient()
         self._started_at: float | None = None
 
     async def close(self) -> None:
-        return None
+        await self._gt.close()
 
     async def start(self) -> None:
         self._running = True
@@ -211,6 +229,15 @@ class CrossChainDetector:
                     prices.append(p)
             if len(prices) < 2:
                 continue
+            # Drop price outliers vs median (junk/fabricated legs) so one bad
+            # leg can't hide a real spread or flag a fake one. (n>=3 only —
+            # median of 2 is meaningless; the 2-leg case is liquidity-vetted
+            # in _try_group.)
+            if len(prices) >= 3:
+                med = _median(prices)
+                prices = [p for p in prices if _sane(p, med, self._max_dev)]
+                if len(prices) < 2:
+                    continue
             cheap, exp = min(prices), max(prices)
             if cheap <= 0:
                 continue
@@ -251,9 +278,53 @@ class CrossChainDetector:
         if len(priced) < 2:
             return False
 
-        priced.sort(key=lambda x: x[2])
-        cheap_chain, cheap_addr, cheap_price = priced[0]
-        exp_chain,   exp_addr,   exp_price   = priced[-1]
+        # Liquidity for ALL legs at once. Only legs with a real pool
+        # (>= alert_min_liq) may be compared — this drops fabricated
+        # fallback prices (e.g. GeckoTerminal inventing a price for a chain
+        # with no pool) and ghost micro-pools, and lets a real spread
+        # between two solid legs surface even when a junk leg exists.
+        async with r.pipeline(transaction=False) as pipe:
+            for c, a, _ in priced:
+                pipe.get(f"cc2:liq_usd:{c}:{norm_addr(a)}")
+            liq_raw = await pipe.execute()
+
+        def _f(v) -> float:
+            try:
+                return float(v) if v else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        liqs = [_f(lq) for lq in liq_raw]
+        # Legs with no cached liq (GT-priced — the batch price endpoint has
+        # no liquidity). Recover real liquidity via GT's per-token /pools
+        # endpoint, but ONLY here (candidate legs, bounded + cached) so the
+        # rate budget is fine. Otherwise legit GT legs get dropped as "?".
+        gaps = [i for i, lv in enumerate(liqs) if lv <= 0]
+        if gaps:
+            recovered = await asyncio.gather(*[
+                self._gt.fetch_liquidity(priced[i][0], priced[i][1])
+                for i in gaps])
+            for i, lv in zip(gaps, recovered):
+                liqs[i] = lv
+
+        liquid = [(c, a, p, lv)
+                  for (c, a, p), lv in zip(priced, liqs)
+                  if lv >= self._alert_min_liq]
+        if len(liquid) < 2:
+            log.debug("cc_detector.killed_low_liq", cg_id=cg_id,
+                      liquid=len(liquid), min_liq=self._alert_min_liq)
+            return False
+
+        # Drop price outliers vs median of the liquid legs (n>=3).
+        if len(liquid) >= 3:
+            med = _median([x[2] for x in liquid])
+            liquid = [x for x in liquid if _sane(x[2], med, self._max_dev)]
+            if len(liquid) < 2:
+                return False
+
+        liquid.sort(key=lambda x: x[2])
+        cheap_chain, cheap_addr, cheap_price, cheap_liq = liquid[0]
+        exp_chain,   exp_addr,   exp_price,   exp_liq   = liquid[-1]
         spread = (exp_price - cheap_price) / cheap_price * 100
         if not (self._min_profit <= spread <= self._max_profit):
             return False
@@ -278,24 +349,6 @@ class CrossChainDetector:
                       else tkr_raw)
         else:
             ticker = cg_id[3:] if cg_id.startswith("wh-") else cg_id
-
-        # Liquidity floor on both sides (cached by monitor from DS).
-        async with r.pipeline(transaction=False) as pipe:
-            pipe.get(f"cc2:liq_usd:{cheap_chain}:{norm_addr(cheap_addr)}")
-            pipe.get(f"cc2:liq_usd:{exp_chain}:{norm_addr(exp_addr)}")
-            liq_raw = await pipe.execute()
-
-        def _f(v) -> float:
-            try:
-                return float(v) if v else 0.0
-            except (TypeError, ValueError):
-                return 0.0
-        cheap_liq, exp_liq = _f(liq_raw[0]), _f(liq_raw[1])
-        if cheap_liq < self._alert_min_liq or exp_liq < self._alert_min_liq:
-            log.debug("cc_detector.killed_low_liq", cg_id=cg_id,
-                      cheap_liq=round(cheap_liq), exp_liq=round(exp_liq),
-                      min_liq=self._alert_min_liq)
-            return False
 
         # Cooldown — bucketed by 5% spread so a meaningfully bigger jump
         # re-alerts within the window.

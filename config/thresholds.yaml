@@ -3,6 +3,10 @@ arbitrage:
   min_profit_percent: 6.0
   # Sanity cap — above this we assume a data error, not a real spread.
   max_profit_percent: 500.0
+  # A leg whose price is >Nx (or <1/N) the group median is junk / a
+  # fabricated fallback price (e.g. GeckoTerminal inventing a price for a
+  # chain with no real pool) and is dropped before pairing. Lower = stricter.
+  max_price_deviation_x: 5.0
   # Assumed trade size, only used for the $-amount shown in alerts.
   trade_size_usd: 10000
   # Per (token, chain-pair, 5%-bucket) cooldown.
