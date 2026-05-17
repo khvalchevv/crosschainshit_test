@@ -158,9 +158,11 @@ class TokenMapper:
             await self._purge_dead(dead)
         cg = await self._refresh_coingecko(dead)
         wh = await self._load_bridged_json(dead)
+        sg = await self._load_stargate_json(dead)
         await r.set("cg2:refreshed_at", str(time.time()))
         return {**{f"cg_{k}": v for k, v in cg.items()},
                 **{f"wh_{k}": v for k, v in wh.items()},
+                **{f"sg_{k}": v for k, v in sg.items()},
                 "dead_skipped": len(dead)}
 
     async def purge_registry(self) -> int:
@@ -337,4 +339,87 @@ class TokenMapper:
 
         log.info("token_mapper.bridged_loaded",
                  new_groups=groups, merged_into_cg=merged, contracts=contracts)
+        return {"contracts": contracts, "groups": groups, "merged": merged}
+
+    # Stargate uses its own platform slugs. Most major ones already match
+    # CG_PLATFORM_MAP; these are the ones it names differently but we can
+    # still price. Long-tail Stargate-only chains stay unmapped (skipped) —
+    # harmless, we couldn't price them anyway.
+    _STARGATE_ALIAS = {
+        "bera":         "berachain",
+        "metis":        "metis",
+        "flare":        "flare",
+        "xlayer":       "okex",
+        "coredao":      "core",
+        "cronosevm":    "cronos",
+        "plumephoenix": "plume",
+        "moonriver":    "moonriver",
+        "iota":         "iota",
+    }
+
+    async def _load_stargate_json(self, dead: set[str] | None = None) -> dict[str, int]:
+        """Load the Stargate token list (stargate.finance/api/tokens) and
+        merge it into existing groups (or create standalone sg-{symbol}).
+        Same merge rule as the bridged JSON; bridge tag = 'stargate'.
+        Note: here `platforms` maps slug -> address STRING (no nested obj)."""
+        dead = dead or set()
+        cfg = get_thresholds()["monitor"]
+        path = ROOT / cfg.get("stargate_file", "data/stargate_tokens.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            log.warning("token_mapper.stargate_json_err", err=str(e)[:120])
+            return {"contracts": 0, "groups": 0}
+
+        tokens = data.get("tokens") or {}
+        r = await get_redis()
+        groups = contracts = merged = 0
+
+        for symbol, info in tokens.items():
+            platforms = (info or {}).get("platforms") or {}
+            mapped: dict[str, str] = {}
+            for plat, raw_addr in platforms.items():
+                chain = CG_PLATFORM_MAP.get(plat) or self._STARGATE_ALIAS.get(plat)
+                if not chain:
+                    continue
+                addr = _clean_addr(raw_addr if isinstance(raw_addr, str)
+                                   else (raw_addr or {}).get("address"))
+                if not addr:
+                    continue
+                mapped[chain] = addr
+            if len(mapped) < 2:
+                continue
+
+            existing_gid: str | None = None
+            async with r.pipeline(transaction=False) as pipe:
+                for chain, addr in mapped.items():
+                    pipe.get(f"cg2:contract:{chain}:{addr}")
+                lookups = await pipe.execute()
+            for gid in lookups:
+                if gid:
+                    existing_gid = gid.decode() if isinstance(gid, bytes) else gid
+                    break
+
+            target_gid = existing_gid or f"sg-{symbol.lower()}"
+            if target_gid in dead:
+                continue
+            if existing_gid:
+                merged += 1
+            else:
+                groups += 1
+
+            async with r.pipeline(transaction=False) as pipe:
+                pipe.hset(f"cg2:group:{target_gid}", mapping=mapped)
+                pipe.sadd(f"cg2:sym:{symbol.lower()}", target_gid)
+                pipe.set(f"cg2:tkr:{target_gid}", symbol.lower())
+                for chain, addr in mapped.items():
+                    pipe.set(f"cg2:contract:{chain}:{addr}", target_gid, nx=True)
+                    contracts += 1
+                pipe.sadd(f"cg2:bridges:{target_gid}", "stargate")
+                await pipe.execute()
+
+        log.info("token_mapper.stargate_loaded",
+                 new_groups=groups, merged_into_existing=merged,
+                 contracts=contracts)
         return {"contracts": contracts, "groups": groups, "merged": merged}

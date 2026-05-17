@@ -17,6 +17,8 @@ arbitrage:
 monitor:
   # Bridged-token registry (Wormhole + LayerZero), merged with CoinGecko.
   registry_file: data/all_bridged_tokens.json
+  # Stargate token list (stargate.finance/api/tokens), merged in too.
+  stargate_file: data/stargate_tokens.json
   # Price polling cycle. ~5s is the practical floor — one full sweep of all
   # addresses through the proxy pool takes ~3-7s; lower just hammers the
   # free APIs into rate-limit bans and tanks coverage.
