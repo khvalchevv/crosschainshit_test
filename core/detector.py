@@ -97,6 +97,8 @@ class CrossChainDetector:
         self._max_profit     : float = cfg["max_profit_percent"]
         self._trade_size_usd : float = cfg.get("trade_size_usd", 10000)
         self._cooldown_sec   : int   = cfg["alert_cooldown_sec"]
+        self._structural_skip_sec: int = cfg.get(
+            "structural_skip_sec", 10800)   # 3h continuous -> skip
         self._warmup_sec     : int   = cfg.get("warmup_sec", 60)
         self._interval_sec   : int   = mon.get("detector_interval_sec", 60)
         self._alert_min_liq  : float = mon.get(
@@ -106,6 +108,10 @@ class CrossChainDetector:
         # a chain with no real pool) — dropped before pairing.
         self._max_dev        : float = cfg.get("max_price_deviation_x", 5.0)
         self._odos_verify    : bool  = cfg.get("odos_verify", True)
+        self._odos_usd       : float = cfg.get("odos_quote_usd", 100.0)
+        self._odos_max_impact: float = cfg.get("odos_max_impact_pct", 5.0)
+        self._odos_unverified_max: float = cfg.get(
+            "odos_unverified_max_pct", 60.0)
         self._gt = GeckoTerminalClient()
         self._odos = OdosClient()
         self._started_at: float | None = None
@@ -249,6 +255,38 @@ class CrossChainDetector:
             if self._min_profit <= spread <= self._max_profit:
                 candidates.append((cg_id, group))
 
+        # ── Structural auto-skip ─────────────────────────────────────────
+        # Track per-token how long the spread has been continuously alive
+        # (un-gated by cooldown — refreshed every cycle the token is a
+        # candidate). If it has pinged non-stop for > structural_skip_sec
+        # (3h) it's a registry mismap (same ticker, different non-fungible
+        # contracts), not an arb -> skip. The key keep-alive TTL is short,
+        # so the moment the spread normalises (token stops being a
+        # candidate) the age resets and it can alert again.
+        if candidates:
+            now = time.time()
+            keys = [f"cc2:spr_since:{c}" for c, _ in candidates]
+            async with r.pipeline(transaction=False) as pipe:
+                for k in keys:
+                    pipe.get(k)
+                prevs = await pipe.execute()
+            kept: list[tuple[str, dict[str, str]]] = []
+            async with r.pipeline(transaction=False) as pipe:
+                for (cg_id, group), k, prev in zip(candidates, keys, prevs):
+                    try:
+                        start = float(prev) if prev else now
+                    except (TypeError, ValueError):
+                        start = now
+                    pipe.set(k, str(start), ex=600)
+                    if now - start > self._structural_skip_sec:
+                        log.debug("cc_detector.skipped_structural",
+                                  cg_id=cg_id,
+                                  age_h=round((now - start) / 3600, 1))
+                        continue
+                    kept.append((cg_id, group))
+                await pipe.execute()
+            candidates = kept
+
         if not candidates or self._in_warmup():
             return {"candidates": len(candidates), "alerted": 0}
 
@@ -273,6 +311,13 @@ class CrossChainDetector:
         prices_map: dict[tuple[str, str], float | None],
     ) -> bool:
         r = await get_redis()
+
+        # Early cooldown gate: if this token already alerted within the
+        # cooldown window, skip ALL work (liq fetch + ODOS) for it. This is
+        # what keeps per-cycle ODOS volume low in steady state so ODOS isn't
+        # rate-limited and the veto stays reliable.
+        if await r.exists(f"cc2_cooldown:{cg_id}"):
+            return False
 
         priced: list[tuple[str, str, float]] = []
         for chain, addr in group.items():
@@ -326,39 +371,67 @@ class CrossChainDetector:
             if len(liquid) < 2:
                 return False
 
-        # ── ODOS verification (EVM legs) ─────────────────────────────────
-        # Replace the single-pool DS price with ODOS's routing-graph price
-        # (real cross-DEX value). If ODOS can't route a leg -> not tradable
-        # -> drop it. Solana keeps Jupiter (already aggregated); ODOS-
-        # unsupported chains keep their DS/GT price.
-        if self._odos_verify:
-            ev = [i for i, (c, a, p, lv) in enumerate(liquid)
-                  if _odos_supported(c)]
-            if ev:
-                quotes = await asyncio.gather(*[
-                    self._odos.price(liquid[i][0], liquid[i][1])
-                    for i in ev])
-                drop: set[int] = set()
-                for i, q in zip(ev, quotes):
-                    if q is None:
-                        drop.add(i)            # no route -> not tradable
-                    else:
-                        c, a, _p, lv = liquid[i]
-                        liquid[i] = (c, a, q, lv)
-                if drop:
-                    liquid = [x for j, x in enumerate(liquid)
-                              if j not in drop]
-                if len(liquid) < 2:
-                    log.debug("cc_detector.killed_odos_noroute",
-                              cg_id=cg_id, left=len(liquid))
-                    return False
-
         liquid.sort(key=lambda x: x[2])
-        cheap_chain, cheap_addr, cheap_price, cheap_liq = liquid[0]
-        exp_chain,   exp_addr,   exp_price,   exp_liq   = liquid[-1]
-        spread = (exp_price - cheap_price) / cheap_price * 100
-        if not (self._min_profit <= spread <= self._max_profit):
+
+        # ── ODOS verify on the final cheap/exp pair only ────────────────
+        # (1) replace each EVM leg's single-pool price with ODOS's routing
+        #     price and recompute the spread — kills price artifacts
+        #     (GEKKO/VIRTUAL, Fabwelt, Maga: ODOS gives the same real price
+        #     both sides -> spread collapses -> bail early, no quote needed).
+        # (2) only if the spread still qualifies, a $odos_quote_usd swap
+        #     quote vetoes dead/illiquid legs (SESH/ZKJ: $100 -> $14).
+        #     None state = ODOS couldn't answer: kept on normal spreads,
+        #     dropped only when spread is extreme (>odos_unverified_max).
+        async def _opx(leg):
+            c, a, _p, _lv = leg
+            if not (self._odos_verify and _odos_supported(c)):
+                return None
+            return await self._odos.price(c, a)
+
+        async def _ostate(leg):
+            c, a, _p, _lv = leg
+            if not (self._odos_verify and _odos_supported(c)):
+                return True
+            return await self._odos.tradable(
+                c, a, self._odos_usd, self._odos_max_impact)
+
+        cheap = exp = None
+        cheap_price = exp_price = 0.0
+        while len(liquid) >= 2:
+            lo, hi = liquid[0], liquid[-1]
+            cp, ep = await asyncio.gather(_opx(lo), _opx(hi))
+            lo_p = cp if cp else lo[2]
+            hi_p = ep if ep else hi[2]
+            if hi_p < lo_p:
+                lo, hi = hi, lo
+                lo_p, hi_p = hi_p, lo_p
+            spread = (hi_p - lo_p) / lo_p * 100 if lo_p else 0.0
+            if not (self._min_profit <= spread <= self._max_profit):
+                return False  # artifact collapsed / out of range
+
+            cs, es = await asyncio.gather(_ostate(lo), _ostate(hi))
+
+            def _bad(st) -> bool:
+                return st is False or (
+                    st is None and spread > self._odos_unverified_max)
+
+            if not _bad(cs) and not _bad(es):
+                cheap, exp = lo, hi
+                cheap_price, exp_price = lo_p, hi_p
+                break
+            drop = set()
+            if _bad(cs):
+                drop.add(lo)
+            if _bad(es):
+                drop.add(hi)
+            liquid = [x for x in liquid if x not in drop]
+        if cheap is None:
+            log.debug("cc_detector.killed_odos", cg_id=cg_id)
             return False
+
+        cheap_chain, cheap_addr, _dp, cheap_liq = cheap
+        exp_chain,   exp_addr,   _dp2, exp_liq  = exp
+        spread = (exp_price - cheap_price) / cheap_price * 100
 
         # Spread age: first time this (token, cheap→exp) crossed the
         # threshold. The key is kept alive (TTL refreshed) every cycle the
@@ -381,11 +454,9 @@ class CrossChainDetector:
         else:
             ticker = cg_id[3:] if cg_id.startswith("wh-") else cg_id
 
-        # Cooldown — bucketed by 5% spread so a meaningfully bigger jump
-        # re-alerts within the window.
-        bucket = int(spread / 5)
-        dedup_key = (f"cc2_alerted:{cg_id}:{cheap_chain}:{exp_chain}:b{bucket}")
-        claimed = await r.set(dedup_key, "1",
+        # Per-token cooldown: claim atomically. Checked early next cycles
+        # (top of _try_group) so a cooled token costs zero liq/ODOS work.
+        claimed = await r.set(f"cc2_cooldown:{cg_id}", "1",
                               ex=self._cooldown_sec, nx=True)
         if not claimed:
             return False

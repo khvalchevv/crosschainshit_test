@@ -428,7 +428,7 @@ class Alerter:
         async for _ in r.scan_iter(match="cc2:price:*", count=1000):
             prices += 1
         alerts_active = 0
-        async for _ in r.scan_iter(match="cc2_alerted:*", count=1000):
+        async for _ in r.scan_iter(match="cc2_cooldown:*", count=1000):
             alerts_active += 1
         bl = await r.scard(_BLACKLIST_KEY)
 

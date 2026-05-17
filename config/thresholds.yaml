@@ -3,17 +3,27 @@ arbitrage:
   min_profit_percent: 6.0
   # Sanity cap — above this we assume a data error, not a real spread.
   max_profit_percent: 500.0
-  # Before alerting, replace each EVM leg's single-pool price with ODOS's
-  # routing-graph price; drop legs ODOS can't route (not tradable).
+  # Before alerting, run a real ODOS swap quote of odos_quote_usd for each
+  # EVM leg; drop legs ODOS can't route or whose price impact exceeds
+  # odos_max_impact_pct (dead/ghost pool — untradable at size).
   odos_verify: true
+  odos_quote_usd: 100.0
+  odos_max_impact_pct: 5.0
+  # If ODOS can't answer (rate-limited) AND the spread is above this, the
+  # unverified leg is treated as fake and dropped. Normal spreads with an
+  # unverifiable leg are kept (no blind over-drop).
+  odos_unverified_max_pct: 60.0
   # A leg whose price is >Nx (or <1/N) the group median is junk / a
   # fabricated fallback price (e.g. GeckoTerminal inventing a price for a
   # chain with no real pool) and is dropped before pairing. Lower = stricter.
   max_price_deviation_x: 5.0
   # Assumed trade size, only used for the $-amount shown in alerts.
   trade_size_usd: 10000
-  # Per (token, chain-pair, 5%-bucket) cooldown.
-  alert_cooldown_sec: 180
+  # Per-token cooldown: re-alert every 5 min while the spread stays actual.
+  alert_cooldown_sec: 300
+  # Spread continuously alive longer than this (3h) = registry mismap, not
+  # an arb -> skip. Auto-releases the moment the spread normalises.
+  structural_skip_sec: 10800
   # Startup grace period — populate prices, don't alert yet.
   warmup_sec: 60
 
