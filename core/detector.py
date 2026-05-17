@@ -22,6 +22,7 @@ from typing import Any, Callable, Coroutine
 
 from config import get_thresholds
 from core.geckoterminal import GeckoTerminalClient
+from core.odos import OdosClient, supported as _odos_supported
 from core.monitor import _EXCLUDED_CHAINS
 from utils import get_logger, get_redis, norm_addr
 
@@ -104,11 +105,14 @@ class CrossChainDetector:
         # fabricated-fallback price (e.g. GeckoTerminal inventing a price for
         # a chain with no real pool) — dropped before pairing.
         self._max_dev        : float = cfg.get("max_price_deviation_x", 5.0)
+        self._odos_verify    : bool  = cfg.get("odos_verify", True)
         self._gt = GeckoTerminalClient()
+        self._odos = OdosClient()
         self._started_at: float | None = None
 
     async def close(self) -> None:
         await self._gt.close()
+        await self._odos.close()
 
     async def start(self) -> None:
         self._running = True
@@ -321,6 +325,33 @@ class CrossChainDetector:
             liquid = [x for x in liquid if _sane(x[2], med, self._max_dev)]
             if len(liquid) < 2:
                 return False
+
+        # ── ODOS verification (EVM legs) ─────────────────────────────────
+        # Replace the single-pool DS price with ODOS's routing-graph price
+        # (real cross-DEX value). If ODOS can't route a leg -> not tradable
+        # -> drop it. Solana keeps Jupiter (already aggregated); ODOS-
+        # unsupported chains keep their DS/GT price.
+        if self._odos_verify:
+            ev = [i for i, (c, a, p, lv) in enumerate(liquid)
+                  if _odos_supported(c)]
+            if ev:
+                quotes = await asyncio.gather(*[
+                    self._odos.price(liquid[i][0], liquid[i][1])
+                    for i in ev])
+                drop: set[int] = set()
+                for i, q in zip(ev, quotes):
+                    if q is None:
+                        drop.add(i)            # no route -> not tradable
+                    else:
+                        c, a, _p, lv = liquid[i]
+                        liquid[i] = (c, a, q, lv)
+                if drop:
+                    liquid = [x for j, x in enumerate(liquid)
+                              if j not in drop]
+                if len(liquid) < 2:
+                    log.debug("cc_detector.killed_odos_noroute",
+                              cg_id=cg_id, left=len(liquid))
+                    return False
 
         liquid.sort(key=lambda x: x[2])
         cheap_chain, cheap_addr, cheap_price, cheap_liq = liquid[0]
